@@ -15,6 +15,9 @@ An AI-powered application that allows users to upload a PDF and ask questions in
 
 ---
 
+<img width="1920" height="1080" alt="Screenshot from 2026-04-17 13-09-59" src="https://github.com/user-attachments/assets/0e680eaf-11ec-4088-849e-21e13c3028a8" />
+
+
 ## 🧠 How It Works
 
 1. **PDF Upload**
