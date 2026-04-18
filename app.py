@@ -1,79 +1,108 @@
+import streamlit as st
+import tempfile
+
+# LangChain imports
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_ollama import OllamaLLM
-from langchain.schema import Document
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.llms import HuggingFacePipeline
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
 
-# ========== STEP 1: LOAD PDF ==========
-try:
-    loader = PyPDFLoader("sample.pdf")
-    documents = loader.load()
-    print("Documents loaded:", len(documents))
-except Exception as e:
-    print("Error loading PDF:", e)
-    documents = []
+# Transformers (local model)
+from transformers import pipeline
 
-# Debug: show content
-for i, doc in enumerate(documents):
-    print(f"\nDoc {i} preview:\n", repr(doc.page_content[:200]))
+# Streamlit page config
+st.set_page_config(page_title="Chat with PDF")
+st.title(" Chat with your PDF")
 
-# ========== STEP 2: CLEAN EMPTY TEXT ==========
-documents = [doc for doc in documents if doc.page_content.strip()]
-print("\nAfter cleaning empty docs:", len(documents))
+# Upload PDF
+uploaded_file = st.file_uploader("Upload a PDF", type="pdf")
 
-# 🚨 Fallback if PDF is empty
-if len(documents) == 0:
-    print("\n⚠️ PDF has no readable text. Using fallback sample data...\n")
-    documents = [
-        Document(
-            page_content="RAG stands for Retrieval Augmented Generation. It helps large language models answer questions using external data."
-        )
-    ]
 
-# ========== STEP 3: SPLIT INTO CHUNKS ==========
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50
-)
+#  Cache embedding + vector store (important for speed)
+@st.cache_resource
+def create_vectorstore(file_path):
+    loader = PyPDFLoader(file_path)
+    docs = loader.load()
 
-docs = text_splitter.split_documents(documents)
-print("Chunks created:", len(docs))
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=100
+    )
+    chunks = splitter.split_documents(docs)
 
-# 🚨 Safety check
-if len(docs) == 0:
-    raise ValueError("No text chunks created. Check your PDF content.")
-
-# ========== STEP 4: EMBEDDINGS ==========
-embedding = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
-
-# ========== STEP 5: VECTOR DB ==========
-db = Chroma.from_documents(docs, embedding)
-
-# ========== STEP 6: LOAD LLM ==========
-llm = OllamaLLM(model="llama3")
-
-# ========== STEP 7: QUERY LOOP ==========
-retriever = db.as_retriever()
-
-while True:
-    query = input("\nAsk something (or type 'exit'): ")
-
-    if query.lower() == "exit":
-        break
-
-    # Retrieve docs
-    relevant_docs = retriever.invoke(query)
-    print("Retrieved docs:", len(relevant_docs))
-
-    # Combine context
-    context = " ".join([doc.page_content for doc in relevant_docs])
-
-    # Generate answer
-    response = llm.invoke(
-        f"Answer ONLY from this context:\n{context}\n\nQuestion: {query}"
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
-    print("\nAnswer:\n", response)
+    db = FAISS.from_documents(chunks, embeddings)
+    return db
+
+
+#  Load local LLM (cached)
+@st.cache_resource
+def load_llm():
+    pipe = pipeline(
+    "text-generation",
+    model="google/flan-t5-base",
+    max_length=512
+)
+    return HuggingFacePipeline(pipeline=pipe)
+
+
+if uploaded_file is not None:
+    st.info("Processing PDF...")
+
+    # Save uploaded file temporarily
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(uploaded_file.read())
+        file_path = tmp_file.name
+
+    try:
+        db = create_vectorstore(file_path)
+    except Exception as e:
+        st.error(f"Failed to process PDF: {e}")
+        st.stop()
+
+    retriever = db.as_retriever(search_kwargs={"k": 3})
+
+    llm = load_llm()
+
+    # Prompt Template
+    prompt = PromptTemplate.from_template(
+        "Answer the question based only on the context:\n{context}\n\nQuestion: {question}"
+    )
+
+    # Helper function
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    # RAG chain
+    rag_chain = (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    st.success("PDF processed! Ask your question 👇")
+
+    query = st.text_input("Ask a question from the PDF")
+
+    if query:
+        with st.spinner("Generating answer..."):
+            response = rag_chain.invoke(query)
+
+        st.subheader("Answer:")
+        st.write(response)
+
+        # Show sources
+        st.subheader("Source Chunks:")
+        results = db.similarity_search(query, k=2)
+        for i, r in enumerate(results, 1):
+            st.markdown(f"**Chunk {i}:**")
+            st.write(r.page_content)
+            st.write("---")
